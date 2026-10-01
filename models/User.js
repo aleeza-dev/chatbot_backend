@@ -17,10 +17,27 @@ const userSchema = new mongoose.Schema(
     },
 
     password: {
-      type: String,
-      required: true,
-      minlength: 6,
-    },
+  type: String,
+  required: false,
+  minlength: 6,
+},
+
+googleId: {
+  type: String,
+  unique: true,
+  sparse: true,
+},
+
+avatar: {
+  type: String,
+  default: "",
+},
+
+authProvider: {
+  type: String,
+  enum: ["local", "google"],
+  default: "local",
+}
   },
   {
     timestamps: true,

@@ -51,9 +51,20 @@ const connectDB = async () => {
 // MIDDLEWARE
 // =====================================================
 
+const allowedOrigins = [
+  "http://localhost:5173",
+  "https://chatbotfrontend-mu.vercel.app",
+];
+
 app.use(
   cors({
-    origin: "http://localhost:5173",
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
   })
 );
 
@@ -81,6 +92,23 @@ app.get("/", (req, res) => {
 // =====================================================
 
 const modePrompts = {
+  general: `
+You are NexaAI, a helpful AI assistant.
+
+You can help the user with:
+- General questions
+- Learning
+- Programming
+- Technology
+- Writing
+- Problem solving
+- Everyday questions
+
+Give clear, accurate and useful answers.
+
+Use simple explanations when possible.
+`,
+
   coding: `
 You are NexaAI, an expert programming assistant.
 
@@ -101,6 +129,27 @@ When code is required:
 - Use proper code blocks.
 - Explain important parts briefly.
 - Prefer beginner-friendly explanations when possible.
+`,
+
+  study: `
+You are NexaAI in Study mode.
+
+Help the user understand educational concepts clearly.
+
+You can help with:
+- Computer science
+- Mathematics
+- Programming
+- Engineering
+- General academic topics
+- Exam preparation
+- Concept explanations
+
+Explain difficult topics in simple language.
+
+Use examples when useful.
+
+If the user asks for a step-by-step explanation, provide it clearly.
 `,
 
   explain: `
@@ -206,236 +255,370 @@ Do not ask multiple interview questions at once.
 };
 
 // =====================================================
+// GEMINI RETRY FUNCTION
+// =====================================================
+
+const generateAIResponse = async (contents) => {
+  const maxRetries = 3;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      console.log(
+        `🤖 Gemini request attempt ${attempt + 1}/${maxRetries}`
+      );
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3.6-flash",
+        contents,
+      });
+
+      console.log("✅ Gemini response received");
+
+      return response;
+    } catch (error) {
+      console.error(
+        `⚠️ Gemini attempt ${attempt + 1} failed`
+      );
+
+      console.error(
+        error?.message || error
+      );
+
+      const status =
+        error?.status ||
+        error?.code ||
+        error?.response?.status;
+
+      const isTemporaryError =
+        status === 429 ||
+        status === 500 ||
+        status === 502 ||
+        status === 503 ||
+        status === 504 ||
+        status === "RESOURCE_EXHAUSTED" ||
+        status === "UNAVAILABLE";
+
+      // If this is not a temporary error,
+      // don't keep retrying.
+      if (!isTemporaryError) {
+        throw error;
+      }
+
+      // Last attempt failed
+      if (attempt === maxRetries - 1) {
+        throw error;
+      }
+
+      // Exponential backoff:
+      // 1 second
+      // 2 seconds
+      // 4 seconds
+
+      const delay =
+        1000 * Math.pow(2, attempt);
+
+      console.log(
+        `⏳ Gemini temporarily unavailable. Retrying in ${
+          delay / 1000
+        } seconds...`
+      );
+
+      await new Promise((resolve) =>
+        setTimeout(resolve, delay)
+      );
+    }
+  }
+
+  throw new Error(
+    "Gemini AI is currently unavailable."
+  );
+};
+
+// =====================================================
+// FRIENDLY GEMINI ERROR
+// =====================================================
+
+const getGeminiErrorMessage = (error) => {
+  const status =
+    error?.status ||
+    error?.code ||
+    error?.response?.status;
+
+  if (
+    status === 503 ||
+    status === "UNAVAILABLE"
+  ) {
+    return "NexaAI is temporarily busy right now. Please try again in a few seconds. 💙";
+  }
+
+  if (
+    status === 429 ||
+    status === "RESOURCE_EXHAUSTED"
+  ) {
+    return "NexaAI is receiving too many requests right now. Please wait a moment and try again.";
+  }
+
+  if (
+    status === 500 ||
+    status === 502 ||
+    status === 504
+  ) {
+    return "NexaAI is temporarily unavailable. Please try again in a few moments.";
+  }
+
+  return "NexaAI could not generate a response right now. Please try again.";
+};
+
+// =====================================================
 // CHAT ROUTE
 // =====================================================
 
-app.post("/api/chat", authMiddleware, async (req, res) => {
-  try {
-    const {
-      message,
-      history = [],
-      mode = "coding",
-    } = req.body;
+app.post(
+  "/api/chat",
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const {
+        message,
+        history = [],
+        mode = "general",
+      } = req.body;
 
-    // -------------------------------------------------
-    // Validate message
-    // -------------------------------------------------
+      // -------------------------------------------------
+      // Validate message
+      // -------------------------------------------------
 
-    if (!message || !message.trim()) {
-      return res.status(400).json({
+      if (!message || !message.trim()) {
+        return res.status(400).json({
+          success: false,
+          message: "Message is required",
+        });
+      }
+
+      // -------------------------------------------------
+      // Select mode prompt
+      // -------------------------------------------------
+
+      const selectedPrompt =
+        modePrompts[mode] ||
+        modePrompts.general;
+
+      // -------------------------------------------------
+      // Clean conversation history
+      // -------------------------------------------------
+
+      const cleanHistory =
+        Array.isArray(history)
+          ? history
+              .filter(
+                (item) =>
+                  item &&
+                  (item.role === "user" ||
+                    item.role === "assistant") &&
+                  typeof item.content === "string"
+              )
+              .slice(-10)
+          : [];
+
+      // -------------------------------------------------
+      // Build conversation
+      // -------------------------------------------------
+
+      const conversation = [
+        {
+          role: "system",
+          content: selectedPrompt,
+        },
+
+        ...cleanHistory,
+
+        {
+          role: "user",
+          content: message.trim(),
+        },
+      ];
+
+      // -------------------------------------------------
+      // Convert conversation to text
+      // -------------------------------------------------
+
+      const formattedConversation =
+        conversation
+          .map((item) => {
+            if (item.role === "system") {
+              return `SYSTEM:\n${item.content}`;
+            }
+
+            if (item.role === "user") {
+              return `USER:\n${item.content}`;
+            }
+
+            return `ASSISTANT:\n${item.content}`;
+          })
+          .join("\n\n");
+
+      console.log(
+        `🤖 NexaAI request | User: ${req.user.userId} | Mode: ${mode}`
+      );
+
+      // -------------------------------------------------
+      // Send request to Gemini with retry
+      // -------------------------------------------------
+
+      const aiResponse =
+        await generateAIResponse(
+          formattedConversation
+        );
+
+      // -------------------------------------------------
+      // Get AI response
+      // -------------------------------------------------
+
+      const reply =
+        aiResponse?.text ||
+        "Sorry, NexaAI could not generate a response.";
+
+      // -------------------------------------------------
+      // Save chat to MongoDB
+      // -------------------------------------------------
+
+      const savedChat = await Chat.create({
+        userId: req.user.userId,
+        message: message.trim(),
+        aiResponse: reply,
+        mode,
+      });
+
+      console.log(
+        `💬 Chat saved successfully | Chat ID: ${savedChat._id}`
+      );
+
+      // -------------------------------------------------
+      // Send response to frontend
+      // -------------------------------------------------
+
+      return res.json({
+        success: true,
+        reply,
+        mode,
+      });
+    } catch (error) {
+      console.error("❌ NexaAI Error:");
+      console.error(error);
+
+      const friendlyMessage =
+        getGeminiErrorMessage(error);
+
+      return res.status(503).json({
         success: false,
-        message: "Message is required",
+        message: friendlyMessage,
       });
     }
-
-    // -------------------------------------------------
-    // Select mode prompt
-    // -------------------------------------------------
-
-    const selectedPrompt =
-      modePrompts[mode] || modePrompts.coding;
-
-    // -------------------------------------------------
-    // Clean conversation history
-    // -------------------------------------------------
-
-    const cleanHistory = Array.isArray(history)
-      ? history
-          .filter(
-            (item) =>
-              item &&
-              (item.role === "user" ||
-                item.role === "assistant") &&
-              typeof item.content === "string"
-          )
-          .slice(-10)
-      : [];
-
-    // -------------------------------------------------
-    // Build conversation
-    // -------------------------------------------------
-
-    const conversation = [
-      {
-        role: "system",
-        content: selectedPrompt,
-      },
-
-      ...cleanHistory,
-
-      {
-        role: "user",
-        content: message.trim(),
-      },
-    ];
-
-    // -------------------------------------------------
-    // Convert conversation to text
-    // -------------------------------------------------
-
-    const formattedConversation = conversation
-      .map((item) => {
-        if (item.role === "system") {
-          return `SYSTEM:\n${item.content}`;
-        }
-
-        if (item.role === "user") {
-          return `USER:\n${item.content}`;
-        }
-
-        return `ASSISTANT:\n${item.content}`;
-      })
-      .join("\n\n");
-
-    console.log(
-      `🤖 NexaAI request | User: ${req.user.userId} | Mode: ${mode}`
-    );
-
-    // -------------------------------------------------
-    // Send request to Gemini
-    // -------------------------------------------------
-
-    const aiResponse = await ai.models.generateContent({
-      model: "gemini-3.6-flash",
-      contents: formattedConversation,
-    });
-
-    // -------------------------------------------------
-    // Get AI response
-    // -------------------------------------------------
-
-    const reply =
-      aiResponse.text ||
-      "Sorry, NexaAI could not generate a response.";
-
-    // -------------------------------------------------
-    // Save chat to MongoDB
-    // IMPORTANT: Chat model uses userId
-    // -------------------------------------------------
-
-    const savedChat = await Chat.create({
-      userId: req.user.userId,
-      message: message.trim(),
-      aiResponse: reply,
-      mode,
-    });
-
-    console.log(
-      `💬 Chat saved successfully | Chat ID: ${savedChat._id}`
-    );
-
-    // -------------------------------------------------
-    // Send response to frontend
-    // -------------------------------------------------
-
-    return res.json({
-      success: true,
-      reply,
-      mode,
-    });
-  } catch (error) {
-    console.error("❌ NexaAI Error:");
-    console.error(error);
-
-    return res.status(500).json({
-      success: false,
-      message:
-        error?.message ||
-        "NexaAI is currently unavailable.",
-    });
   }
-});
+);
 
 // =====================================================
 // CHAT HISTORY ROUTE
 // =====================================================
 
-app.get("/api/history", authMiddleware, async (req, res) => {
-  try {
-    const chats = await Chat.find({
-      userId: req.user.userId,
-    })
-      .sort({ createdAt: -1 })
-      .limit(100);
+app.get(
+  "/api/history",
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const chats = await Chat.find({
+        userId: req.user.userId,
+      })
+        .sort({ createdAt: -1 })
+        .limit(100);
 
-    return res.json({
-      success: true,
-      history: chats,
-    });
-  } catch (error) {
-    console.error("❌ History Error:");
-    console.error(error);
+      return res.json({
+        success: true,
+        history: chats,
+      });
+    } catch (error) {
+      console.error("❌ History Error:");
+      console.error(error);
 
-    return res.status(500).json({
-      success: false,
-      message: "Unable to load chat history.",
-    });
+      return res.status(500).json({
+        success: false,
+        message: "Unable to load chat history.",
+      });
+    }
   }
-});
+);
 
 // =====================================================
 // FEEDBACK ROUTE
 // =====================================================
 
-app.post("/api/feedback", async (req, res) => {
-  try {
-    const {
-      message,
-      aiResponse,
-      feedback,
-      mode = "general",
-    } = req.body;
+app.post(
+  "/api/feedback",
+  async (req, res) => {
+    try {
+      const {
+        message,
+        aiResponse,
+        feedback,
+        mode = "general",
+      } = req.body;
 
-    // -------------------------------------------------
-    // Validate feedback
-    // -------------------------------------------------
+      // -------------------------------------------------
+      // Validate feedback
+      // -------------------------------------------------
 
-    if (
-      !message ||
-      !aiResponse ||
-      !["like", "dislike"].includes(feedback)
-    ) {
-      return res.status(400).json({
+      if (
+        !message ||
+        !aiResponse ||
+        !["like", "dislike"].includes(
+          feedback
+        )
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Valid message, aiResponse and feedback are required",
+        });
+      }
+
+      // -------------------------------------------------
+      // Save feedback to MongoDB
+      // -------------------------------------------------
+
+      const savedFeedback =
+        await Feedback.create({
+          message,
+          aiResponse,
+          feedback,
+          mode,
+        });
+
+      console.log(
+        `👍/👎 Feedback saved | Type: ${feedback} | Mode: ${mode}`
+      );
+
+      // -------------------------------------------------
+      // Send response
+      // -------------------------------------------------
+
+      return res.status(201).json({
+        success: true,
+        message: "Feedback saved successfully",
+        feedback: savedFeedback,
+      });
+    } catch (error) {
+      console.error(
+        "❌ Feedback Error:"
+      );
+      console.error(error);
+
+      return res.status(500).json({
         success: false,
-        message:
-          "Valid message, aiResponse and feedback are required",
+        message: "Unable to save feedback",
       });
     }
-
-    // -------------------------------------------------
-    // Save feedback to MongoDB
-    // -------------------------------------------------
-
-    const savedFeedback = await Feedback.create({
-      message,
-      aiResponse,
-      feedback,
-      mode,
-    });
-
-    console.log(
-      `👍/👎 Feedback saved | Type: ${feedback} | Mode: ${mode}`
-    );
-
-    // -------------------------------------------------
-    // Send response
-    // -------------------------------------------------
-
-    return res.status(201).json({
-      success: true,
-      message: "Feedback saved successfully",
-      feedback: savedFeedback,
-    });
-  } catch (error) {
-    console.error("❌ Feedback Error:");
-    console.error(error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Unable to save feedback",
-    });
   }
-});
+);
 
 // =====================================================
 // 404 ROUTE
@@ -460,7 +643,9 @@ const startServer = async () => {
       `🚀 NexaAI backend running on port ${PORT}`
     );
 
-    console.log("🤖 Gemini AI connected");
+    console.log(
+      "🤖 Gemini AI connected"
+    );
   });
 };
 
