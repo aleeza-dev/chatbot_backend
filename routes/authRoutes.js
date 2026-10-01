@@ -316,10 +316,9 @@ router.post("/google", async (req, res) => {
       user.googleId = googleId;
       user.avatar = picture;
 
-      // Keep password if account originally used
-      // email/password authentication.
-      user.authProvider =
-        user.password ? "local+google" : "google";
+      // Keep existing password if the account was
+      // originally created with email/password.
+      user.authProvider = "google";
 
       await user.save();
 
